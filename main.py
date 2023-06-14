@@ -3,6 +3,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
+from sklearn.metrics import f1_score, precision_recall_curve
 
 import nltk
 import numpy as np
@@ -18,8 +19,8 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.tokenization_utils import PaddingStrategy
-from SegmentatorTrainer import ExtractiveSummarizatorTrainer
-from SegmentatorModel import ExtractiveSummarizatorModel
+from ExtractorTrainer import ExtractorTrainer
+from ExtractorModel import ExtractorModel
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from nltk.metrics.segmentation import pk, windowdiff, ghd
@@ -43,7 +44,7 @@ except (LookupError, OSError):
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(
-        default="google/bigbird-roberta-base",
+        default="bert-base-uncased",
         metadata={
             "help": "Path to pretrained model or model identifier from huggingface.co/models"
         },
@@ -88,8 +89,12 @@ class DataTrainingArguments:
         default=2,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+    context_window: Optional[int] = field(
+        default=9,
+        metadata={"help": "The size of context window to be used by cross attention."},
+    )
     max_source_length: Optional[int] = field(
-        default=4096,
+        default=512,
         metadata={
             "help": "The maximum total input sequence length after tokenization."
         },
@@ -130,10 +135,9 @@ class DataTrainingArguments:
 def load_dataset(ami_xml_dir, dataset_cache_file):
     if os.path.isdir(dataset_cache_file):
         return DatasetDict.load_from_disk(dataset_cache_file)
-
     datasets = AMICorpusHandler(ami_corpus_dir=ami_xml_dir).get_all_meetings_data()
-    datasets = datasets.train_test_split(test_size=0.30)
-    aux_datasets = datasets["test"].train_test_split(test_size=0.5)
+    datasets = datasets.train_test_split(test_size=0.30, shuffle=False)
+    aux_datasets = datasets["test"].train_test_split(test_size=0.5, shuffle=False)
     datasets["test"] = aux_datasets["train"]
     datasets["validation"] = aux_datasets["test"]
     datasets.save_to_disk(dataset_cache_file)
@@ -149,45 +153,79 @@ def parse_arguments():
     return parser.parse_args_into_dataclasses()
 
 
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+
+
 def compute_metrics(eval_pred):
     metrics = ["accuracy", "recall", "precision", "f1"]
     metric = {}
     for met in metrics:
         metric[met] = load(met)
-    logits, labels = eval_pred
+    logits = eval_pred.predictions.flatten()
+    labels = eval_pred.label_ids.flatten()
     logits = 1 / (1 + np.exp(-np.array(logits)))
-    predictions = [1 if i > 0.5 else 0 for i in logits]
+
+    _, _, thresholds = precision_recall_curve(labels, logits)
+    f1_scores = [f1_score(labels, logits >= t) for t in thresholds]
+    optimal_threshold = thresholds[np.argmax(f1_scores)]
+
+    print("==============================")
+    print(f"Optimal Treshold: {optimal_threshold}")
+    print("==============================")
+
+    predictions = (logits >= optimal_threshold).astype(int)
+
     metric_res = {}
     for met in metrics:
         metric_res[met] = metric[met].compute(
             predictions=predictions, references=labels
         )[met]
-    window_size = int(len(labels) * 0.25)
-    predictions = "".join([str(x) for x in predictions])
-    labels = "".join([str(x) for x in labels])
-    metric_res["pk"] = pk(ref=predictions, hyp=labels, k=window_size)
-    metric_res["windowdiff"] = windowdiff(seg1=predictions, seg2=labels, k=window_size)
-    metric_res["ghd"] = ghd(ref=predictions, hyp=labels)
+    cm = confusion_matrix(labels, predictions)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    plt.show()
+    # window_size = int(len(labels) * 0.25)
+    # predictions = "".join([str(x) for x in predictions])
+    # labels = "".join([str(x) for x in labels])
+    # metric_res["pk"] = pk(ref=predictions, hyp=labels, k=window_size)
+    # metric_res["windowdiff"] = windowdiff(seg1=predictions, seg2=labels, k=window_size)
+    # metric_res["ghd"] = ghd(ref=predictions, hyp=labels)
     return metric_res
 
 
-def preprocess_dataset(data, tokenizer, max_length=4096):
-    labels = []
-    for sublist in data["topics"]:
-        sublist[0] = torch.tensor(1)
-        labels.extend(sublist)
-    data = tokenizer(
-        [sentence for sublist in data["sentences"] for sentence in sublist],
-        add_special_tokens=True,
-        padding=PaddingStrategy.MAX_LENGTH,
-        truncation=True,
-        max_length=max_length,
-        return_token_type_ids=True,
-        return_attention_mask=True,
-        return_tensors="pt",
-        verbose=True,
-    )
-    data["labels"] = torch.stack(labels)
+def preprocess_dataset(data, tokenizer, max_length=512, context_window=9):
+    context_batches = {"sentences": [], "extractive": []}
+    for sentences, extractive in zip(data["sentences"], data["extractive"]):
+        for i in range(len(sentences) - (context_window - 1)):
+            context_batches["sentences"].append(
+                tokenizer(
+                    sentences[i : i + context_window],
+                    add_special_tokens=True,
+                    padding=PaddingStrategy.MAX_LENGTH,
+                    truncation=True,
+                    max_length=max_length,
+                    return_token_type_ids=True,
+                    return_attention_mask=True,
+                    return_tensors="pt",
+                    verbose=True,
+                )
+            )
+            context_batches["extractive"].append(extractive[i : i + context_window])
+
+    data = {
+        "input_ids": torch.stack(
+            [context["input_ids"] for context in context_batches["sentences"]]
+        ),
+        "token_type_ids": torch.stack(
+            [context["token_type_ids"] for context in context_batches["sentences"]]
+        ),
+        "attention_mask": torch.stack(
+            [context["attention_mask"] for context in context_batches["sentences"]]
+        ),
+        "labels": torch.stack(context_batches["extractive"]),
+    }
+
     return data
 
 
@@ -237,7 +275,6 @@ def main():
         cache_dir=model_args.cache_dir,
         num_labels=1,
         classifier_dropout=0.5,
-        block_size=16,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -253,20 +290,28 @@ def main():
         f"{data_args.ami_xml_dir}cache/dataset",
     )
 
-    datasets = datasets.map(
-        preprocess_dataset,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_length": data_args.max_source_length,
-        },
-        batched=True,
-        batch_size=5,
-        remove_columns=datasets["train"].column_names,
-    )
+    preprocessed_dir = f"{data_args.ami_xml_dir}cache/preprocessed"
+    if os.path.isdir(preprocessed_dir):
+        datasets = DatasetDict.load_from_disk(preprocessed_dir)
 
-    datasets["train"]["labels"][0] = 0
-    datasets["test"]["labels"][0] = 0
-    datasets["validation"]["labels"][0] = 0
+    else:
+        datasets = load_dataset(
+            data_args.ami_xml_dir,
+            f"{data_args.ami_xml_dir}cache/dataset",
+        )
+
+        datasets = datasets.map(
+            preprocess_dataset,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_length": data_args.max_source_length,
+            },
+            batched=True,
+            batch_size=5,
+            remove_columns=datasets["train"].column_names,
+        )
+
+        datasets.save_to_disk(preprocessed_dir)
 
     if not (
         training_args.do_train or training_args.do_eval or training_args.do_predict
@@ -282,10 +327,18 @@ def main():
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = datasets["train"]
+
+        # Undersample the dataset
+        train_dataset = train_dataset.filter(lambda x: sum(x["labels"]) > 0)
+
+        train_dataset = train_dataset.shuffle()
+
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
-        num_pos = sum(train_dataset["labels"])
-        bce_pos_weight = len(train_dataset["labels"]) - num_pos / num_pos
+
+        labels = train_dataset["labels"].flatten()
+        pos_labels = sum(labels).item()
+        bce_pos_weight = (len(labels) - pos_labels) / pos_labels
 
     if training_args.do_eval:
         if "validation" not in datasets:
@@ -303,9 +356,13 @@ def main():
 
     data_collator = DefaultDataCollator()
 
-    model = ExtractiveSummarizatorModel(config, bce_pos_weight=bce_pos_weight)
+    model = ExtractorModel(
+        config,
+        bce_pos_weight=bce_pos_weight,
+        sequence_length=data_args.max_source_length,
+    )
 
-    trainer = ExtractiveSummarizatorTrainer(
+    trainer = ExtractorTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
