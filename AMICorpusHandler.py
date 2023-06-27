@@ -287,33 +287,27 @@ class AMICorpusHandler:
         :return: meeting
         """
 
+        ns = {"nite": "http://nite.sourceforge.net/"}
+
         def __get_nested_topics(element):
-            topics = []
-            if element.tag == "topic":
-                topics.append(element)
-            for child in element:
-                topics.extend(__get_nested_topics(child))
-            return topics
+            result = []
+            topics = element.findall("topic", ns)
+            for topic in topics:
+                topic_result = []
+                children = topic.findall("nite:child", ns)
+                for child in children:
+                    topic_result.append(child.get("href"))
+                result.append(topic_result)
+                result.extend(__get_nested_topics(topic))
+            return result
 
         topic_file = os.path.join(self.topic_dir, meeting["topic"])
         root = ET.parse(topic_file).getroot()
         topics = __get_nested_topics(root)
 
         for topic in topics:
-            topic_words = []
-            for child in topic:
-                if child.tag == "{http://nite.sourceforge.net/}child":
-                    topic_words.append(child.attrib["href"])
-                if child.tag == "topic":
-                    if len(topic_words) > 0:
-                        file, _, end_id = self.__get_file_and_ids(topic_words[-1])
-                        speaker = file.split(".")[1]
-                        end_id = self.__get_word_index(end_id)
-                        meeting["speakers"][speaker]["data"]["words"][end_id][
-                            "end_topic"
-                        ] = True
-            if len(topic_words) > 0:
-                file, _, end_id = self.__get_file_and_ids(topic_words[-1])
+            if len(topic) > 0:
+                file, _, end_id = self.__get_file_and_ids(topic[-1])
                 speaker = file.split(".")[1]
                 end_id = self.__get_word_index(end_id)
                 meeting["speakers"][speaker]["data"]["words"][end_id][
@@ -358,28 +352,38 @@ class AMICorpusHandler:
         Get data for all meetings by calling the get_meeting_data method for each meeting.
         :return: dict, a dictionary with the results of calling get_meeting_data for each meeting
         """
-        dataset = {}
         meetings = self.__group_meetings_files()
+
+        datasets = []
+        last_end_topic = None
         for meeting_id in tqdm(meetings.keys()):
-            dataset[meeting_id] = self.__get_meeting_data(meetings[meeting_id])
-        return Dataset.from_list(
-            [
+            data = self.__get_meeting_data(meetings[meeting_id])
+            sentences = []
+            topics = []
+            extractive = []
+            abstractive = []
+            for d in data["data"]["transcript"]:
+                sentences.append(d["sentence"])
+                is_end_topic = 1 if d["end_topic"] else 0
+                if last_end_topic == 1 and is_end_topic == 1:
+                    if len(topics) > 0:
+                        topics[-1] = 0
+                last_end_topic = is_end_topic
+                topics.append(is_end_topic)
+                extractive.append(1 if d["extractive"] else 0)
+            for d in data["data"]["abstractive"].values():
+                abstract = d["abstract"]
+                extract = []
+                for s in d["extract"]:
+                    extract.append(s["sentence"])
+                abstractive.append({"abstract": abstract, "extract": extract})
+            datasets.append(
                 {
-                    "sentences": [d["sentence"] for d in data["data"]["transcript"]],
-                    "topics": [
-                        1 if d["end_topic"] else 0 for d in data["data"]["transcript"]
-                    ],
-                    "extractive": [
-                        1 if d["extractive"] else 0 for d in data["data"]["transcript"]
-                    ],
-                    "abstractive": [
-                        {
-                            "abstract": d["abstract"],
-                            "extract": [s["sentence"] for s in d["extract"]],
-                        }
-                        for d in data["data"]["abstractive"].values()
-                    ],
+                    "sentences": sentences,
+                    "topics": topics,
+                    "extractive": extractive,
+                    "abstractive": abstractive,
                 }
-                for data in tqdm(dataset.values())
-            ]
-        ).with_format(type="torch")
+            )
+
+        return Dataset.from_list(datasets).with_format(type="torch")

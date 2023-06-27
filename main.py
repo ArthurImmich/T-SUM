@@ -18,14 +18,18 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.tokenization_utils import PaddingStrategy
-from SegmentatorTrainer import ExtractiveSummarizatorTrainer
-from SegmentatorModel import ExtractiveSummarizatorModel
+from SegmentatorTrainer import SegmentatorTrainer
+from SegmentatorModel import SegmentatorModel
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from nltk.metrics.segmentation import pk, windowdiff, ghd
 from AMICorpusHandler import AMICorpusHandler
-from datasets import DatasetDict
+from datasets import Dataset, DatasetDict, concatenate_datasets
 import torch
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score, precision_recall_curve
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ except (LookupError, OSError):
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(
-        default="google/bigbird-roberta-base",
+        default="bert-base-uncased",
         metadata={
             "help": "Path to pretrained model or model identifier from huggingface.co/models"
         },
@@ -72,6 +76,10 @@ class ModelArguments:
             "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
         },
     )
+    classifier_dropout: float = field(
+        default=0.3,
+        metadata={"help": "Dropout level"},
+    )
 
 
 @dataclass
@@ -88,8 +96,12 @@ class DataTrainingArguments:
         default=2,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+    context_window: Optional[int] = field(
+        default=9,
+        metadata={"help": "The size of context window to be used by cross attention."},
+    )
     max_source_length: Optional[int] = field(
-        default=4096,
+        default=512,
         metadata={
             "help": "The maximum total input sequence length after tokenization."
         },
@@ -130,10 +142,9 @@ class DataTrainingArguments:
 def load_dataset(ami_xml_dir, dataset_cache_file):
     if os.path.isdir(dataset_cache_file):
         return DatasetDict.load_from_disk(dataset_cache_file)
-
     datasets = AMICorpusHandler(ami_corpus_dir=ami_xml_dir).get_all_meetings_data()
-    datasets = datasets.train_test_split(test_size=0.30)
-    aux_datasets = datasets["test"].train_test_split(test_size=0.5)
+    datasets = datasets.train_test_split(test_size=0.30, shuffle=False)
+    aux_datasets = datasets["test"].train_test_split(test_size=0.5, shuffle=False)
     datasets["test"] = aux_datasets["train"]
     datasets["validation"] = aux_datasets["test"]
     datasets.save_to_disk(dataset_cache_file)
@@ -150,31 +161,47 @@ def parse_arguments():
 
 
 def compute_metrics(eval_pred):
-    metrics = ["accuracy", "recall", "precision", "f1"]
+    metrics = ["accuracy", "precision", "recall", "f1"]
     metric = {}
     for met in metrics:
         metric[met] = load(met)
-    logits, labels = eval_pred
-    logits = 1 / (1 + np.exp(-np.array(logits)))
-    predictions = [1 if i > 0.5 else 0 for i in logits]
+    logits = eval_pred.predictions
+    labels = eval_pred.label_ids
+    _, _, thresholds = precision_recall_curve(labels, logits)
+    f1_scores = [f1_score(labels, logits >= t) for t in thresholds]
+    optimal_threshold = thresholds[np.argmax(f1_scores)]
+
+    print("==============================")
+    print(f"Optimal Treshold: {optimal_threshold}")
+    print("==============================")
+
+    predictions = (logits >= optimal_threshold).astype(int)
+
     metric_res = {}
     for met in metrics:
         metric_res[met] = metric[met].compute(
             predictions=predictions, references=labels
         )[met]
+    cm = confusion_matrix(labels, predictions)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    plt.show()
+
     window_size = int(len(labels) * 0.25)
     predictions = "".join([str(x) for x in predictions])
     labels = "".join([str(x) for x in labels])
     metric_res["pk"] = pk(ref=predictions, hyp=labels, k=window_size)
     metric_res["windowdiff"] = windowdiff(seg1=predictions, seg2=labels, k=window_size)
     metric_res["ghd"] = ghd(ref=predictions, hyp=labels)
+
     return metric_res
 
 
-def preprocess_dataset(data, tokenizer, max_length=4096):
+def flatten_dataset(data, tokenizer, max_length=512):
     labels = []
     for sublist in data["topics"]:
-        sublist[0] = torch.tensor(1)
+        sublist[-1] = torch.tensor(1)
+        sublist[0] = torch.tensor(0)
         labels.extend(sublist)
     data = tokenizer(
         [sentence for sublist in data["sentences"] for sentence in sublist],
@@ -191,10 +218,30 @@ def preprocess_dataset(data, tokenizer, max_length=4096):
     return data
 
 
+def context_dataset(dataset, context_window):
+    def data_generator():
+        index = context_window // 2
+        for i in range(len(dataset)):
+            data = dataset[i : i + context_window]
+            label = data["labels"][index]
+            data["labels"] = label
+            yield data
+
+    return Dataset.from_generator(data_generator)
+
+
 def main():
     model_args, data_args, training_args = parse_arguments()
 
     last_checkpoint = None
+
+    if not (
+        training_args.do_train or training_args.do_eval or training_args.do_predict
+    ):
+        logger.info(
+            "There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`."
+        )
+        return
 
     if (
         os.path.isdir(training_args.output_dir)
@@ -213,7 +260,7 @@ def main():
             )
 
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
@@ -236,8 +283,7 @@ def main():
         else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         num_labels=1,
-        classifier_dropout=0.5,
-        block_size=16,
+        classifier_dropout=model_args.classifier_dropout,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -248,44 +294,77 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
     )
 
+    cache_dir = f"{data_args.ami_xml_dir}cache"
+
+    if data_args.overwrite_cache and os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+
     datasets = load_dataset(
         data_args.ami_xml_dir,
-        f"{data_args.ami_xml_dir}cache/dataset",
+        f"{cache_dir}/dataset",
     )
 
-    datasets = datasets.map(
-        preprocess_dataset,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_length": data_args.max_source_length,
-        },
-        batched=True,
-        batch_size=5,
-        remove_columns=datasets["train"].column_names,
-    )
+    preprocessed_dir = f"{cache_dir}/preprocessed"
+    if os.path.isdir(preprocessed_dir):
+        datasets = DatasetDict.load_from_disk(preprocessed_dir)
 
-    datasets["train"]["labels"][0] = 0
-    datasets["test"]["labels"][0] = 0
-    datasets["validation"]["labels"][0] = 0
-
-    if not (
-        training_args.do_train or training_args.do_eval or training_args.do_predict
-    ):
-        logger.info(
-            "There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`."
+    else:
+        datasets = load_dataset(
+            data_args.ami_xml_dir,
+            f"{data_args.ami_xml_dir}cache/dataset",
         )
-        return
 
-    bce_pos_weight = None
+        datasets = datasets.map(
+            flatten_dataset,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_length": data_args.max_source_length,
+            },
+            batched=True,
+            batch_size=5,
+            remove_columns=datasets["train"].column_names,
+        )
+
+        datasets["train"] = context_dataset(
+            datasets["train"],
+            data_args.context_window,
+        )
+
+        datasets["test"] = context_dataset(
+            datasets["test"],
+            data_args.context_window,
+        )
+
+        datasets["validation"] = context_dataset(
+            datasets["validation"],
+            data_args.context_window,
+        )
+
+        datasets.save_to_disk(preprocessed_dir)
 
     if training_args.do_train:
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
+
         train_dataset = datasets["train"]
+
+        train_dataset = train_dataset.shuffle()
+
+        positive_dataset = train_dataset.filter(
+            lambda x: x["labels"] == 1,
+        )
+
+        train_dataset = concatenate_datasets(
+            [
+                positive_dataset,
+                train_dataset.filter(
+                    lambda x: x["labels"] == 0,
+                ).select(range(len(positive_dataset))),
+            ]
+        )
+
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
-        num_pos = sum(train_dataset["labels"])
-        bce_pos_weight = len(train_dataset["labels"]) - num_pos / num_pos
 
     if training_args.do_eval:
         if "validation" not in datasets:
@@ -303,9 +382,16 @@ def main():
 
     data_collator = DefaultDataCollator()
 
-    model = ExtractiveSummarizatorModel(config, bce_pos_weight=bce_pos_weight)
+    model = SegmentatorModel(config)
 
-    trainer = ExtractiveSummarizatorTrainer(
+    if torch.cuda.is_available():
+        device = "cuda:0"
+    elif training_args.use_mps_device:
+        device = "mps"
+    else:
+        device = "cpu"
+
+    trainer = SegmentatorTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -313,6 +399,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        device=device,
     )
 
     if training_args.do_train:
