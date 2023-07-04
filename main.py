@@ -1,35 +1,24 @@
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
 import nltk
 import numpy as np
-from evaluate import load
-
 import transformers
-from filelock import FileLock
-from transformers import (
-    AutoConfig,
-    AutoTokenizer,
-    DefaultDataCollator,
-    HfArgumentParser,
-    TrainingArguments,
-)
-from transformers.tokenization_utils import PaddingStrategy
-from SegmentatorTrainer import SegmentatorTrainer
-from SegmentatorModel import SegmentatorModel
-from transformers.file_utils import is_offline_mode
-from transformers.trainer_utils import get_last_checkpoint, is_main_process
-from nltk.metrics.segmentation import pk, windowdiff, ghd
 from AMICorpusHandler import AMICorpusHandler
-from datasets import Dataset, DatasetDict, concatenate_datasets
-import torch
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-import matplotlib.pyplot as plt
-from sklearn.metrics import f1_score, precision_recall_curve
-import shutil
+from datasets import DatasetDict
+from evaluate import load
+from filelock import FileLock
+from transformers import AutoTokenizer, DataCollatorForSeq2Seq, HfArgumentParser
+from transformers.file_utils import is_offline_mode
+from transformers.models.bigbird_pegasus import BigBirdPegasusForConditionalGeneration
+from transformers.tokenization_utils import PaddingStrategy
+from transformers.trainer_seq2seq import Seq2SeqTrainer
+from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 
 logger = logging.getLogger(__name__)
 
@@ -46,22 +35,10 @@ except (LookupError, OSError):
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(
-        default="bert-base-uncased",
+    model_name: str = field(
+        default="google/bigbird-roberta-base",
         metadata={
-            "help": "Path to pretrained model or model identifier from huggingface.co/models"
-        },
-    )
-    config_name: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Pretrained config name or path if not the same as model_name"
-        },
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Pretrained tokenizer name or path if not the same as model_name"
+            "help": "Path to pretrained encoder model from huggingface.co/models"
         },
     )
     cache_dir: Optional[str] = field(
@@ -101,7 +78,7 @@ class DataTrainingArguments:
         metadata={"help": "The size of context window to be used by cross attention."},
     )
     max_source_length: Optional[int] = field(
-        default=512,
+        default=4096,
         metadata={
             "help": "The maximum total input sequence length after tokenization."
         },
@@ -153,58 +130,20 @@ def load_dataset(ami_xml_dir, dataset_cache_file):
 
 def parse_arguments():
     parser = HfArgumentParser(
-        (ModelArguments, DataTrainingArguments, TrainingArguments)
+        (ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments)
     )
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         return parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     return parser.parse_args_into_dataclasses()
 
 
-def compute_metrics(eval_pred):
-    metrics = ["accuracy", "precision", "recall", "f1"]
-    metric = {}
-    for met in metrics:
-        metric[met] = load(met)
-    logits = eval_pred.predictions
-    labels = eval_pred.label_ids
-    _, _, thresholds = precision_recall_curve(labels, logits)
-    f1_scores = [f1_score(labels, logits >= t) for t in thresholds]
-    optimal_threshold = thresholds[np.argmax(f1_scores)]
+def preprocess_dataset(data, tokenizer, max_length=4096):
+    for meeting in data["abstractive"]:
+        abstract = [topic["abstract"] for topic in meeting]
+        extract = [" ".join(topic["extract"]) for topic in meeting]
 
-    print("==============================")
-    print(f"Optimal Treshold: {optimal_threshold}")
-    print("==============================")
-
-    predictions = (logits >= optimal_threshold).astype(int)
-
-    metric_res = {}
-    for met in metrics:
-        metric_res[met] = metric[met].compute(
-            predictions=predictions, references=labels
-        )[met]
-    cm = confusion_matrix(labels, predictions)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-    disp.plot()
-    plt.show()
-
-    window_size = int(len(labels) * 0.25)
-    predictions = "".join([str(x) for x in predictions])
-    labels = "".join([str(x) for x in labels])
-    metric_res["pk"] = pk(ref=predictions, hyp=labels, k=window_size)
-    metric_res["windowdiff"] = windowdiff(seg1=predictions, seg2=labels, k=window_size)
-    metric_res["ghd"] = ghd(ref=predictions, hyp=labels)
-
-    return metric_res
-
-
-def flatten_dataset(data, tokenizer, max_length=512):
-    labels = []
-    for sublist in data["topics"]:
-        sublist[-1] = torch.tensor(1)
-        sublist[0] = torch.tensor(0)
-        labels.extend(sublist)
-    data = tokenizer(
-        [sentence for sublist in data["sentences"] for sentence in sublist],
+    tokenized_data = tokenizer(
+        extract,
         add_special_tokens=True,
         padding=PaddingStrategy.MAX_LENGTH,
         truncation=True,
@@ -214,20 +153,20 @@ def flatten_dataset(data, tokenizer, max_length=512):
         return_tensors="pt",
         verbose=True,
     )
-    data["labels"] = torch.stack(labels)
-    return data
+    with tokenizer.as_target_tokenizer():
+        tokenized_data["labels"] = tokenizer(
+            abstract,
+            add_special_tokens=True,
+            padding=PaddingStrategy.MAX_LENGTH,
+            truncation=True,
+            max_length=max_length,
+            return_token_type_ids=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+            verbose=True,
+        ).input_ids
 
-
-def context_dataset(dataset, context_window):
-    def data_generator():
-        index = context_window // 2
-        for i in range(len(dataset)):
-            data = dataset[i : i + context_window]
-            label = data["labels"][index]
-            data["labels"] = label
-            yield data
-
-    return Dataset.from_generator(data_generator)
+    return tokenized_data
 
 
 def main():
@@ -277,19 +216,8 @@ def main():
         transformers.utils.logging.set_verbosity_info()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    config = AutoConfig.from_pretrained(
-        model_args.config_name
-        if model_args.config_name
-        else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        num_labels=1,
-        classifier_dropout=model_args.classifier_dropout,
-    )
-
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name
-        if model_args.tokenizer_name
-        else model_args.model_name_or_path,
+        model_args.model_name,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
     )
@@ -315,7 +243,7 @@ def main():
         )
 
         datasets = datasets.map(
-            flatten_dataset,
+            preprocess_dataset,
             fn_kwargs={
                 "tokenizer": tokenizer,
                 "max_length": data_args.max_source_length,
@@ -325,44 +253,21 @@ def main():
             remove_columns=datasets["train"].column_names,
         )
 
-        datasets["train"] = context_dataset(
-            datasets["train"],
-            data_args.context_window,
-        )
-
-        datasets["test"] = context_dataset(
-            datasets["test"],
-            data_args.context_window,
-        )
-
-        datasets["validation"] = context_dataset(
-            datasets["validation"],
-            data_args.context_window,
-        )
+        columns = [
+            "input_ids",
+            "labels",
+            "input_ids",
+            "attention_mask",
+        ]
+        datasets.set_format(type="torch", columns=columns)
 
         datasets.save_to_disk(preprocessed_dir)
 
     if training_args.do_train:
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
-
         train_dataset = datasets["train"]
-
         train_dataset = train_dataset.shuffle()
-
-        positive_dataset = train_dataset.filter(
-            lambda x: x["labels"] == 1,
-        )
-
-        train_dataset = concatenate_datasets(
-            [
-                positive_dataset,
-                train_dataset.filter(
-                    lambda x: x["labels"] == 0,
-                ).select(range(len(positive_dataset))),
-            ]
-        )
-
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
@@ -380,18 +285,22 @@ def main():
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
 
-    data_collator = DefaultDataCollator()
+    model = BigBirdPegasusForConditionalGeneration.from_pretrained(
+        model_args.model_name,
+    )
 
-    model = SegmentatorModel(config)
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    if torch.cuda.is_available():
-        device = "cuda:0"
-    elif training_args.use_mps_device:
-        device = "mps"
-    else:
-        device = "cpu"
+    def compute_metrics(eval_pred):
+        rouge = load("rouge")
+        gold = tokenizer.batch_decode(eval_pred.label_ids, skip_special_tokens=True)
+        generated = tokenizer.batch_decode(
+            eval_pred.predictions, skip_special_tokens=True
+        )
+        metrics = rouge.compute(predictions=generated[0], references=gold)
+        return metrics
 
-    trainer = SegmentatorTrainer(
+    trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -399,14 +308,13 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        device=device,
     )
 
     if training_args.do_train:
         if last_checkpoint is not None:
             checkpoint = last_checkpoint
-        elif os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
+        elif os.path.isdir(model_args.model_name):
+            checkpoint = model_args.model_name
         else:
             checkpoint = None
 
