@@ -9,7 +9,7 @@ class SegmentatorTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.pop("labels").squeeze().float()
-        loss_fct = torch.nn.BCELoss()
+        loss_fct = torch.nn.MSELoss()
         outputs = model(**inputs)
         loss = loss_fct(outputs[1], labels)
         return (loss, outputs) if return_outputs else loss

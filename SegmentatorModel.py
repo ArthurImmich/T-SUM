@@ -1,6 +1,6 @@
 import torch
 from torch.nn import Linear, Dropout, Sigmoid, Module
-from transformers import AutoModel, BertPreTrainedModel
+from transformers import BertModel
 from transformers.modeling_outputs import ModelOutput
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -36,10 +36,9 @@ class SegmentatorClassificationHead(Module):
         return x
 
 
-class SegmentatorModel(BertPreTrainedModel):
-    def __init__(self, config, sequence_length=512):
+class SegmentatorModel(BertModel):
+    def __init__(self, config):
         super().__init__(config)
-        self.encoder = AutoModel.from_config(config)
         self.mhattention = torch.nn.MultiheadAttention(
             self.encoder.config.hidden_size,
             self.encoder.config.num_attention_heads,
@@ -85,7 +84,7 @@ class SegmentatorModel(BertPreTrainedModel):
             inputs_embeds_shape = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(-1, inputs_embeds_shape[-1])
 
-        encoder_outputs = self.encoder(
+        encoder_outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -97,37 +96,14 @@ class SegmentatorModel(BertPreTrainedModel):
             return_dict=True,
         )
 
-        """
-        The MultiheadAttention layer expects its inputs to have shape (sequence_length, batch_size, hidden_size),
-        while the hidden_states tensor returned by the encoder has shape (batch_size, sequence_length, hidden_size).
-        Transposing the first two dimensions of the hidden_states tensor changes its shape to (sequence_length, batch_size, hidden_size),
-        which matches the expected input shape of the MultiheadAttention layer.
-        """
-
         cls_last_hidden_state = encoder_outputs.last_hidden_state[:, 0, :]
 
-        cls_last_hidden_state = cls_last_hidden_state.view(
-            input_ids_shape[0],
-            input_ids_shape[1],
-            self.config.hidden_size,
-        )
-
-        """
-        The MultiheadAttention layer takes three inputs: query, key, and value.
-        It computes attention weights between the query and key tensors and uses these weights to compute a weighted average of the value tensor.
-        In our case, we want to compute attention weights between all pairs of sentences in the batch, so we pass the same tensor (hidden_states) as both the query and key inputs.
-        We also want to compute a weighted average of the hidden states of all sentences in the batch, so we pass the same tensor (hidden_states) as the value input.
-
-        """
-
-        attended_states, cross_attention = self.mhattention(
+        attended_states, _ = self.mhattention(
             cls_last_hidden_state,
             cls_last_hidden_state,
             cls_last_hidden_state,
         )
-
-        attended_states = attended_states[:, input_ids_shape[1] // 2, :]
 
         logits = self.classifier(attended_states).squeeze()
 
-        return (None, logits)
+        return (None, logits.squeeze())

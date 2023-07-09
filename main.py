@@ -85,7 +85,7 @@ class ModelArguments:
 @dataclass
 class DataTrainingArguments:
     ami_xml_dir: str = field(
-        default="data/",
+        default="./data",
         metadata={"help": "AMI Corpus download directory"},
     )
     overwrite_cache: bool = field(
@@ -95,10 +95,6 @@ class DataTrainingArguments:
     preprocessing_num_workers: Optional[int] = field(
         default=2,
         metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    context_window: Optional[int] = field(
-        default=9,
-        metadata={"help": "The size of context window to be used by cross attention."},
     )
     max_source_length: Optional[int] = field(
         default=512,
@@ -167,6 +163,10 @@ def compute_metrics(eval_pred):
         metric[met] = load(met)
     logits = eval_pred.predictions
     labels = eval_pred.label_ids
+    for i in range(len(labels)):
+        if labels[i] != 1 and labels[i] != 0:
+            labels[i] = 0
+    labels = labels.astype(int)
     _, _, thresholds = precision_recall_curve(labels, logits)
     f1_scores = [f1_score(labels, logits >= t) for t in thresholds]
     optimal_threshold = thresholds[np.argmax(f1_scores)]
@@ -182,6 +182,7 @@ def compute_metrics(eval_pred):
         metric_res[met] = metric[met].compute(
             predictions=predictions, references=labels
         )[met]
+
     cm = confusion_matrix(labels, predictions)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm)
     disp.plot()
@@ -197,14 +198,46 @@ def compute_metrics(eval_pred):
     return metric_res
 
 
-def flatten_dataset(data, tokenizer, max_length=512):
-    labels = []
-    for sublist in data["topics"]:
-        sublist[-1] = torch.tensor(1)
-        sublist[0] = torch.tensor(0)
-        labels.extend(sublist)
+def preprocess_data(data, tokenizer, max_length=512):
+    topic_labels = []
+    extractive_labels = []
+    for meeting_topics in data["topics"]:
+        meeting_topics[-1] = torch.tensor(1)
+        meeting_topics[0] = torch.tensor(0)
+        topic_labels.extend(meeting_topics)
+    for meeting_extraction in data["extractive"]:
+        extractive_labels.extend(meeting_extraction)
+    new_topic_regression = torch.zeros(len(topic_labels))
+    for i in range(len(topic_labels)):
+        if topic_labels[i] == 1:
+            important_start = 0
+            important_end = len(topic_labels) - 1
+            for j in range(i, 0, -1):
+                if extractive_labels[j] == 1:
+                    important_start = j
+                    break
+            for j in range(i, len(extractive_labels), 1):
+                if extractive_labels[j] == 1:
+                    important_end = j
+                    break
+            if important_start == important_end:
+                new_topic_regression[important_start] = 1
+            else:
+                increasing_value = 1 / (i - important_start)
+                mult = 1
+                for k in range(important_start + 1, i, 1):
+                    new_topic_regression[k] = increasing_value * mult
+                    mult += 1
+                mult = important_end - i
+                for k in range(i, important_end, 1):
+                    if k == i:
+                        new_topic_regression[k] = 1
+                    else:
+                        new_topic_regression[k] = increasing_value * mult
+                    mult -= 1
+
     data = tokenizer(
-        [sentence for sublist in data["sentences"] for sentence in sublist],
+        [sentence for meeting in data["sentences"] for sentence in meeting],
         add_special_tokens=True,
         padding=PaddingStrategy.MAX_LENGTH,
         truncation=True,
@@ -214,20 +247,8 @@ def flatten_dataset(data, tokenizer, max_length=512):
         return_tensors="pt",
         verbose=True,
     )
-    data["labels"] = torch.stack(labels)
+    data["labels"] = new_topic_regression
     return data
-
-
-def context_dataset(dataset, context_window):
-    def data_generator():
-        index = context_window // 2
-        for i in range(len(dataset)):
-            data = dataset[i : i + context_window]
-            label = data["labels"][index]
-            data["labels"] = label
-            yield data
-
-    return Dataset.from_generator(data_generator)
 
 
 def main():
@@ -294,50 +315,49 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
     )
 
-    cache_dir = f"{data_args.ami_xml_dir}cache"
+    cache_dir = f"{data_args.ami_xml_dir}/cache"
 
     if data_args.overwrite_cache and os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
 
-    datasets = load_dataset(
-        data_args.ami_xml_dir,
-        f"{cache_dir}/dataset",
-    )
-
     preprocessed_dir = f"{cache_dir}/preprocessed"
     if os.path.isdir(preprocessed_dir):
         datasets = DatasetDict.load_from_disk(preprocessed_dir)
-
     else:
         datasets = load_dataset(
             data_args.ami_xml_dir,
-            f"{data_args.ami_xml_dir}cache/dataset",
+            f"{data_args.ami_xml_dir}/cache/dataset",
         )
 
-        datasets = datasets.map(
-            flatten_dataset,
+        datasets["train"] = datasets["train"].map(
+            preprocess_data,
             fn_kwargs={
                 "tokenizer": tokenizer,
                 "max_length": data_args.max_source_length,
             },
             batched=True,
-            batch_size=5,
+            batch_size=len(datasets["train"]),
             remove_columns=datasets["train"].column_names,
         )
-
-        datasets["train"] = context_dataset(
-            datasets["train"],
-            data_args.context_window,
+        datasets["test"] = datasets["test"].map(
+            preprocess_data,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_length": data_args.max_source_length,
+            },
+            batched=True,
+            batch_size=len(datasets["test"]),
+            remove_columns=datasets["test"].column_names,
         )
-
-        datasets["test"] = context_dataset(
-            datasets["test"],
-            data_args.context_window,
-        )
-
-        datasets["validation"] = context_dataset(
-            datasets["validation"],
-            data_args.context_window,
+        datasets["validation"] = datasets["validation"].map(
+            preprocess_data,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_length": data_args.max_source_length,
+            },
+            batched=True,
+            batch_size=len(datasets["validation"]),
+            remove_columns=datasets["validation"].column_names,
         )
 
         datasets.save_to_disk(preprocessed_dir)
@@ -347,21 +367,6 @@ def main():
             raise ValueError("--do_train requires a train dataset")
 
         train_dataset = datasets["train"]
-
-        train_dataset = train_dataset.shuffle()
-
-        positive_dataset = train_dataset.filter(
-            lambda x: x["labels"] == 1,
-        )
-
-        train_dataset = concatenate_datasets(
-            [
-                positive_dataset,
-                train_dataset.filter(
-                    lambda x: x["labels"] == 0,
-                ).select(range(len(positive_dataset))),
-            ]
-        )
 
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
