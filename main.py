@@ -3,14 +3,19 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-from sklearn.metrics import f1_score, precision_recall_curve
 
 import nltk
 import numpy as np
-from evaluate import load
-
+import torch
 import transformers
+from AMICorpusHandler import AMICorpusHandler
+from datasets import DatasetDict
+from evaluate import load
+from ExtractorModel import ExtractorModel
+from ExtractorTrainer import ExtractorTrainer
 from filelock import FileLock
+from nltk.metrics.segmentation import ghd, pk, windowdiff
+from sklearn.metrics import f1_score, precision_recall_curve
 from transformers import (
     AutoConfig,
     AutoTokenizer,
@@ -18,15 +23,9 @@ from transformers import (
     HfArgumentParser,
     TrainingArguments,
 )
-from transformers.tokenization_utils import PaddingStrategy
-from ExtractorTrainer import ExtractorTrainer
-from ExtractorModel import ExtractorModel
 from transformers.file_utils import is_offline_mode
+from transformers.tokenization_utils import PaddingStrategy
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
-from nltk.metrics.segmentation import pk, windowdiff, ghd
-from AMICorpusHandler import AMICorpusHandler
-from datasets import DatasetDict
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,7 @@ class ModelArguments:
 @dataclass
 class DataTrainingArguments:
     ami_xml_dir: str = field(
-        default="data/",
+        default="./data",
         metadata={"help": "AMI Corpus download directory"},
     )
     overwrite_cache: bool = field(
@@ -153,8 +152,8 @@ def parse_arguments():
     return parser.parse_args_into_dataclasses()
 
 
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 
 
 def compute_metrics(eval_pred):
