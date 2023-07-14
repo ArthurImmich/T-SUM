@@ -201,43 +201,30 @@ def compute_metrics(eval_pred):
 def preprocess_data(data, tokenizer, max_length=512):
     topic_labels = []
     extractive_labels = []
+    sentences = []
     for meeting_topics in data["topics"]:
         meeting_topics[-1] = torch.tensor(1)
         meeting_topics[0] = torch.tensor(0)
         topic_labels.extend(meeting_topics)
     for meeting_extraction in data["extractive"]:
         extractive_labels.extend(meeting_extraction)
-    new_topic_regression = torch.zeros(len(topic_labels))
+    for sent in data["sentences"]:
+        sentences.extend(sent)
+    extracted_by_topic = []
+    aux = []
     for i in range(len(topic_labels)):
+        if extractive_labels[i] == 1:
+            aux.append(sentences[i])
         if topic_labels[i] == 1:
-            important_start = 0
-            important_end = len(topic_labels) - 1
-            for j in range(i, 0, -1):
-                if extractive_labels[j] == 1:
-                    important_start = j
-                    break
-            for j in range(i, len(extractive_labels), 1):
-                if extractive_labels[j] == 1:
-                    important_end = j
-                    break
-            if important_start == important_end:
-                new_topic_regression[important_start] = 1
-            else:
-                increasing_value = 1 / (i - important_start)
-                mult = 1
-                for k in range(important_start + 1, i, 1):
-                    new_topic_regression[k] = increasing_value * mult
-                    mult += 1
-                mult = important_end - i
-                for k in range(i, important_end, 1):
-                    if k == i:
-                        new_topic_regression[k] = 1
-                    else:
-                        new_topic_regression[k] = increasing_value * mult
-                    mult -= 1
-
+            extracted_by_topic.append(aux)
+            aux = []
+    labels = []
+    sentences = []
+    for i, topic in enumerate(extracted_by_topic):
+        labels.extend([0 if (i % 2) == 0 else 1] * len(topic))
+        sentences.extend(topic)
     data = tokenizer(
-        [sentence for meeting in data["sentences"] for sentence in meeting],
+        sentences,
         add_special_tokens=True,
         padding=PaddingStrategy.MAX_LENGTH,
         truncation=True,
@@ -247,7 +234,7 @@ def preprocess_data(data, tokenizer, max_length=512):
         return_tensors="pt",
         verbose=True,
     )
-    data["labels"] = new_topic_regression
+    data["labels"] = torch.tensor(labels)
     return data
 
 

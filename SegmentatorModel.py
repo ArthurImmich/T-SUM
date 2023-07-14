@@ -60,30 +60,6 @@ class SegmentatorModel(BertModel):
         output_attentions=True,
         output_hidden_states=True,
     ):
-        if input_ids is not None:
-            input_ids_shape = input_ids.shape
-            input_ids = input_ids.reshape(-1, input_ids_shape[-1])
-
-        if attention_mask is not None:
-            attention_mask_shape = attention_mask.shape
-            attention_mask = attention_mask.reshape(-1, attention_mask_shape[-1])
-
-        if token_type_ids is not None:
-            token_type_ids_shape = token_type_ids.shape
-            token_type_ids = token_type_ids.reshape(-1, token_type_ids_shape[-1])
-
-        if position_ids is not None:
-            position_ids_shape = position_ids.shape
-            position_ids = position_ids.reshape(-1, position_ids_shape[-1])
-
-        if head_mask is not None:
-            head_mask_shape = head_mask.shape
-            head_mask = head_mask.reshape(-1, head_mask_shape[-1])
-
-        if inputs_embeds is not None:
-            inputs_embeds_shape = inputs_embeds.shape
-            inputs_embeds = inputs_embeds.reshape(-1, inputs_embeds_shape[-1])
-
         encoder_outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
