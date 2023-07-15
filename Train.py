@@ -307,6 +307,10 @@ def main():
     # ARGUMENTS
     model_args, data_args, training_args = parse_arguments()
 
+    training_args.output_dir = (
+        f"{training_args.output_dir}/{data_args.segmentator_or_extractor}"
+    )
+
     if (
         data_args.segmentator_or_extractor != "segmentator"
         and data_args.segmentator_or_extractor != "extractor"
